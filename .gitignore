@@ -53,6 +53,7 @@ dist/
 /master_intent_brick_360m.gguf
 /gguf_model_audit.md
 /bricks/model_factory/
+/bricks/*.py
 /bricks/brain.wb
 /bricks/emotion.wb
 /bricks/memory.wb
