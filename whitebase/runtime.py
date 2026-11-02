@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -22,11 +24,16 @@ from .manifest import (
 )
 from .message import MessageEnvelope
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_INSTALL_DIR = Path.home() / ".whitebase" / "bricks"
 
 
 class BrickPackageError(ValueError):
+    pass
+
+
+class AmbiguousRoutingError(KeyError):
     pass
 
 
@@ -66,6 +73,7 @@ class WhiteBase:
         self.registry: Dict[str, InstalledBrick] = {}
         self.loaded: Dict[str, InstalledBrick] = {}
         self.capability_index: Dict[str, List[str]] = {}
+        self.discovery_errors: List[Dict[str, Any]] = []
         self._lifecycle_lock = threading.RLock()
         self.events: List[str] = []
         self.start_time = time.time()
@@ -84,12 +92,19 @@ class WhiteBase:
     def _discover_installed(self) -> None:
         entries = sorted(self.install_dir.iterdir()) if self.install_dir.exists() else []
         for entry in entries:
+            # Ignore hidden, staging, or backup temporary directories (e.g. starting with '.')
+            if entry.name.startswith("."):
+                continue
+
             if entry.is_dir():
                 manifest_path = entry / "manifest.json"
                 if manifest_path.exists():
                     try:
                         manifest = load_manifest(manifest_path)
-                    except Exception:
+                    except Exception as exc:
+                        err = {"path": str(entry), "error": str(exc), "type": type(exc).__name__}
+                        self.discovery_errors.append(err)
+                        self.log("ERROR", f"discovery failure in directory {entry}: {exc}")
                         continue
                     installed = InstalledBrick(
                         brick_id=manifest.id,
@@ -100,10 +115,17 @@ class WhiteBase:
                     )
                     self.registry.setdefault(manifest.id, installed)
                     self._index_capabilities(manifest)
+                else:
+                    err = {"path": str(entry), "error": "Missing manifest.json", "type": "FileNotFoundError"}
+                    self.discovery_errors.append(err)
+                    self.log("WARNING", f"directory {entry} has no manifest.json")
             elif entry.suffix.lower() == ".wb":
                 try:
                     self.install(entry)
-                except Exception:
+                except Exception as exc:
+                    err = {"path": str(entry), "error": str(exc), "type": type(exc).__name__}
+                    self.discovery_errors.append(err)
+                    self.log("ERROR", f"discovery install failure for {entry}: {exc}")
                     continue
 
     def _update_runtime_metrics(self, *, success: bool = False, timeout: bool = False, cancelled: bool = False, latency: Optional[float] = None) -> None:
@@ -216,7 +238,9 @@ class WhiteBase:
 
     def _index_capabilities(self, manifest) -> None:
         for cap in manifest.capabilities:
-            self.capability_index.setdefault(cap, []).append(manifest.id)
+            providers = self.capability_index.setdefault(cap, [])
+            if manifest.id not in providers:
+                providers.append(manifest.id)
 
     def list_components(self) -> List[str]:
         return sorted(self.registry.keys())
@@ -347,6 +371,7 @@ class WhiteBase:
             "components": components,
             "capabilities": capability_index,
             "resources": resources,
+            "discovery_errors": list(self.discovery_errors),
             "requests": {
                 "active_requests": runtime["active_requests"],
                 "total_requests": runtime["total_requests"],
@@ -384,11 +409,33 @@ class WhiteBase:
             module_path = Path(brick.install_dir) / manifest.entrypoint.get("module", "connector.py")
             if not module_path.exists():
                 raise FileNotFoundError(f"Brick entrypoint not found: {module_path}")
-            spec = importlib.util.spec_from_file_location(f"whitebase_brick_{component_id}", module_path)
-            if spec is None or spec.loader is None:
-                raise ImportError(f"Unable to import connector module from {module_path}")
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+
+            # Safe module name scoped to brick to prevent collisions between different bricks
+            safe_id = "".join(c if c.isalnum() else "_" for c in component_id)
+            module_name = f"whitebase_brick_{safe_id}"
+
+            # Support sibling module imports by adding brick directory to sys.path during import
+            brick_dir_str = str(Path(brick.install_dir).resolve())
+            path_inserted = False
+            if brick_dir_str not in sys.path:
+                sys.path.insert(0, brick_dir_str)
+                path_inserted = True
+
+            try:
+                spec = importlib.util.spec_from_file_location(module_name, module_path)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"Unable to import connector module from {module_path}")
+                module = importlib.util.module_from_spec(spec)
+                # Register in sys.modules BEFORE exec_module to support dataclasses and sibling imports
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+            finally:
+                if path_inserted:
+                    try:
+                        sys.path.remove(brick_dir_str)
+                    except ValueError:
+                        pass
+
             class_name = manifest.entrypoint.get("class")
             if not class_name:
                 raise KeyError(f"Missing entrypoint.class in manifest for {component_id}")
@@ -470,7 +517,38 @@ class WhiteBase:
             return target
         if not candidates:
             raise KeyError(f"No component registered for capability: {capability}")
-        return candidates[0]
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Multi-provider selection: check priority or default flags in manifest metadata
+        def _get_provider_rank(brick_id: str) -> Tuple[int, int, str]:
+            brick = self.registry.get(brick_id)
+            if brick:
+                try:
+                    manifest = load_manifest(brick.manifest_path)
+                    meta = manifest.metadata or {}
+                    is_default = 1 if meta.get("default") is True else 0
+                    priority = int(meta.get("priority", 0))
+                    return (is_default, priority, brick_id)
+                except Exception:
+                    pass
+            return (0, 0, brick_id)
+
+        # Sort candidates by (is_default desc, priority desc, brick_id asc)
+        ranked = sorted(candidates, key=_get_provider_rank, reverse=True)
+        top = ranked[0]
+        runner_up = ranked[1]
+        top_rank = _get_provider_rank(top)
+        runner_up_rank = _get_provider_rank(runner_up)
+
+        # If top two candidates tie on default status and priority, raise AmbiguousRoutingError
+        if top_rank[0] == runner_up_rank[0] and top_rank[1] == runner_up_rank[1] and top_rank[0] == 0 and top_rank[1] == 0:
+            raise AmbiguousRoutingError(
+                f"Ambiguous routing for capability '{capability}': multiple providers registered {candidates}. "
+                "Specify target explicitly or configure priority/default metadata."
+            )
+
+        return top
 
     def request(self, capability: str, payload: Dict[str, Any], *, target: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, session_id: Optional[str] = None, timeout: Optional[float] = None) -> Any:
         with self._lifecycle_lock:
@@ -490,10 +568,8 @@ class WhiteBase:
             self.runtime_metrics["total_requests"] += 1
             started = time.time()
         try:
-            result = connector.invoke(capability, payload, metadata=metadata or {})
+            result = connector.invoke(capability, payload, metadata=metadata or {}, timeout=timeout)
             elapsed = time.time() - started
-            if timeout is not None and elapsed > timeout:
-                raise TimeoutError(f"Request timed out for {capability} after {timeout}s")
             with self._lifecycle_lock:
                 brick.last_request_time = time.time()
                 brick.last_success_time = time.time()
@@ -585,4 +661,4 @@ class WhiteBase:
         return self.install(package_path)
 
 
-__all__ = ["WhiteBase", "InstalledBrick", "BrickPackageError"]
+__all__ = ["WhiteBase", "InstalledBrick", "BrickPackageError", "AmbiguousRoutingError"]

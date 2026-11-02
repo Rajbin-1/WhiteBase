@@ -5,28 +5,45 @@ on:
   pull_request:
 
 jobs:
-  lightweight-tests:
+  test:
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest]
-        python-version: ["3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install runtime
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build twine
+      - name: Install runtime (editable)
         run: python -m pip install -e .
       - name: Runtime and package contract tests
-        run: python -m unittest discover -s tests -p test_whitebase.py -v
+        run: python -m unittest discover -s tests -p "test_whitebase*.py" -v
       - name: Runtime architecture regression tests
-        run: python -m unittest discover -s tests -p test_architecture_contracts.py -v
+        run: python -m unittest discover -s tests -p "test_architecture_contracts.py" -v
       - name: Runtime stress tests
-        run: python -m unittest discover -s tests/stress -p test_whitebase_stress.py -v
+        run: python -m unittest discover -s tests/stress -p "test_whitebase_stress.py" -v
       - name: Runtime performance tests
+        run: python -m unittest discover -s tests/performance -p "test_whitebase_performance.py" -v
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Twine check
+        run: python -m twine check dist/*
+      - name: Test installed wheel
         run: |
-          python -m unittest discover -s tests/performance -p test_whitebase_performance.py -v
-      - name: Build wheel
-        run: python -m pip wheel --no-deps . --wheel-dir dist
+          python -m pip uninstall -y whitebase
+          python -m pip install (Get-ChildItem dist/*.whl)[0].FullName
+          whitebase --help
+          python -c "import whitebase; print('Installed WhiteBase version:', whitebase.__version__ if hasattr(whitebase, '__version__') else 'ok')"
+        if: runner.os == 'Windows'
+      - name: Test installed wheel (Linux)
+        run: |
+          python -m pip uninstall -y whitebase
+          python -m pip install dist/*.whl
+          whitebase --help
+          python -c "import whitebase; print('Installed WhiteBase version:', whitebase.__version__ if hasattr(whitebase, '__version__') else 'ok')"
+        if: runner.os != 'Windows'

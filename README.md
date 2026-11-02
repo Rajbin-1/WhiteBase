@@ -86,8 +86,9 @@ python -m unittest discover -s tests/performance -p test_whitebase_performance.p
 Local model weights, user datasets, virtual environments, caches, generated
 outputs, and unrelated experiments are not part of this core repository.
 
-No project license is included. Do not redistribute or reuse the project
-without permission from its copyright holder.
+## License
+
+This project is licensed under the [MIT License](LICENSE).
 
 ## Security
 

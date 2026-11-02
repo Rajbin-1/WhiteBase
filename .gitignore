@@ -12,7 +12,7 @@ build/
 dist/
 *.egg-info/
 
-# Local settings and credentials
+# Local settings, secrets, and credentials
 .env
 .env.*
 !.env.example
@@ -27,11 +27,12 @@ dist/
 *.log
 *.lock
 
-# Exclude unrelated Factory code, datasets, model assets, and generated data.
+# Exclude unrelated workspace experiments, datasets, model assets, and Model Factory files
 /src/
 /scripts/
 /data/
 /reports/
+!/reports/core-reliability-release-hygiene.md
 /docs/reports/
 /docs/MODEL_FACTORY.md
 /docs/INTENT_SPECIALIST.md
@@ -53,7 +54,7 @@ dist/
 /master_intent_brick_360m.gguf
 /gguf_model_audit.md
 /bricks/model_factory/
-/bricks/*.py
+/bricks/build_real_bricks.py
 /bricks/brain.wb
 /bricks/emotion.wb
 /bricks/memory.wb
