@@ -404,15 +404,16 @@ class WhiteBase:
             brick.load_count += 1
             self.loaded[component_id] = brick
             return brick.connector
+
+        safe_id = "".join(c if c.isalnum() else "_" for c in component_id)
+        module_name = f"whitebase_brick_{safe_id}"
+        module_registered = False
+
         try:
             manifest = load_manifest(brick.manifest_path)
             module_path = Path(brick.install_dir) / manifest.entrypoint.get("module", "connector.py")
             if not module_path.exists():
                 raise FileNotFoundError(f"Brick entrypoint not found: {module_path}")
-
-            # Safe module name scoped to brick to prevent collisions between different bricks
-            safe_id = "".join(c if c.isalnum() else "_" for c in component_id)
-            module_name = f"whitebase_brick_{safe_id}"
 
             # Support sibling module imports by adding brick directory to sys.path during import
             brick_dir_str = str(Path(brick.install_dir).resolve())
@@ -428,6 +429,7 @@ class WhiteBase:
                 module = importlib.util.module_from_spec(spec)
                 # Register in sys.modules BEFORE exec_module to support dataclasses and sibling imports
                 sys.modules[module_name] = module
+                module_registered = True
                 spec.loader.exec_module(module)
             finally:
                 if path_inserted:
@@ -449,9 +451,11 @@ class WhiteBase:
                 capabilities=list(manifest.capabilities),
                 implementation=instance,
                 manifest=manifest,
-                metadata={"install_dir": brick.install_dir},
+                metadata={"install_dir": brick.install_dir, "module_name": module_name},
             )
         except Exception as exc:
+            if module_registered:
+                sys.modules.pop(module_name, None)
             brick.connector = None
             brick.state = "error"
             brick.loaded = False
@@ -498,6 +502,10 @@ class WhiteBase:
                 brick.last_error_time = time.time()
                 self.log("ERROR", f"component unload failed: {component_id}: {exc}")
                 raise
+            finally:
+                mod_name = brick.connector.metadata.get("module_name")
+                if mod_name:
+                    sys.modules.pop(mod_name, None)
         brick.connector = None
         brick.state = "stopped"
         brick.loaded = False
@@ -534,7 +542,6 @@ class WhiteBase:
                     pass
             return (0, 0, brick_id)
 
-        # Sort candidates by (is_default desc, priority desc, brick_id asc)
         ranked = sorted(candidates, key=_get_provider_rank, reverse=True)
         top = ranked[0]
         runner_up = ranked[1]
@@ -542,9 +549,9 @@ class WhiteBase:
         runner_up_rank = _get_provider_rank(runner_up)
 
         # If top two candidates tie on default status and priority, raise AmbiguousRoutingError
-        if top_rank[0] == runner_up_rank[0] and top_rank[1] == runner_up_rank[1] and top_rank[0] == 0 and top_rank[1] == 0:
+        if top_rank[0] == runner_up_rank[0] and top_rank[1] == runner_up_rank[1]:
             raise AmbiguousRoutingError(
-                f"Ambiguous routing for capability '{capability}': multiple providers registered {candidates}. "
+                f"Ambiguous routing for capability '{capability}': multiple providers registered {candidates} with equal rank {top_rank[:2]}. "
                 "Specify target explicitly or configure priority/default metadata."
             )
 
@@ -618,10 +625,59 @@ class WhiteBase:
             resolved = self._resolve_target(capability, target)
             if resolved not in self.loaded:
                 self.load(resolved)
-            connector = self.loaded[resolved].connector
-            if connector is None:
+            brick = self.loaded.get(resolved)
+            if brick is None or brick.connector is None:
                 raise RuntimeError(f"Component is not loaded: {resolved}")
-        return iter(connector.stream(capability, payload, metadata=metadata or {}))
+            connector = brick.connector
+
+            # Obtain raw stream iterator
+            raw_iter = iter(connector.stream(capability, payload, metadata=metadata or {}))
+
+            # Mark brick and runtime active
+            brick.state = "running"
+            brick.running = True
+            brick.connectivity = "connected"
+            brick.active_requests += 1
+            self.runtime_metrics["active_requests"] += 1
+            self.runtime_metrics["total_requests"] += 1
+            started = time.time()
+
+        def _managed_stream() -> Iterator[Any]:
+            success = False
+            try:
+                for chunk in raw_iter:
+                    yield chunk
+                success = True
+            except Exception as exc:
+                with self._lifecycle_lock:
+                    brick.failed_requests += 1
+                    brick.last_error_time = time.time()
+                    brick.health = "unhealthy"
+                    brick.connectivity = "disconnected"
+                    brick.state = "error"
+                    self.runtime_metrics["failed_requests"] += 1
+                    self.log("ERROR", f"stream error: {capability} via {resolved}: {exc}")
+                raise
+            finally:
+                elapsed = time.time() - started
+                with self._lifecycle_lock:
+                    brick.active_requests = max(0, brick.active_requests - 1)
+                    self.runtime_metrics["active_requests"] = max(0, self.runtime_metrics["active_requests"] - 1)
+                    if brick.active_requests == 0 and brick.state == "running":
+                        brick.state = "loaded"
+
+                    if success:
+                        brick.last_request_time = time.time()
+                        brick.last_success_time = time.time()
+                        brick.last_latency = elapsed
+                        brick.successful_requests += 1
+                        brick.average_latency = ((brick.average_latency * max(brick.successful_requests - 1, 1)) + elapsed) / max(brick.successful_requests, 1)
+                        self.runtime_metrics["successful_requests"] += 1
+                        self.runtime_metrics["total_latency"] += elapsed
+                        self.runtime_metrics["average_latency"] = self.runtime_metrics["total_latency"] / self.runtime_metrics["total_requests"]
+                        self.log("INFO", f"stream completed: {capability} via {resolved} in {elapsed:.4f}s")
+
+        return _managed_stream()
 
     def remove(self, component_id: str) -> None:
         with self._lifecycle_lock:

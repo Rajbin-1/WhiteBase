@@ -7,7 +7,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from whitebase.manifest import ManifestValidationError, validate_manifest
+from whitebase.manifest import ManifestValidationError, validate_manifest, validate_package_archive
 from whitebase.runtime import AmbiguousRoutingError, BrickPackageError, WhiteBase
 
 
@@ -141,6 +141,26 @@ class AuditedDefectsRegressionTests(unittest.TestCase):
         self.assertEqual(self.wb.request("cap1", {}, target="brick1"), {"brick": 1})
         self.assertEqual(self.wb.request("cap2", {}, target="brick2"), {"brick": 2})
 
+    def test_sys_modules_cleaned_up_on_unload_and_load_failure(self) -> None:
+        import sys
+        conn = "class Brick:\n    def invoke(self, c, p, metadata=None): return 1\n"
+        pkg = create_brick(self.tempdir / "clean.wb", brick_id="cleanup_brick", capability="clean_cap", connector_code=conn)
+        self.wb.install(pkg)
+        self.wb.load("cleanup_brick")
+        mod_name = "whitebase_brick_cleanup_brick"
+        self.assertIn(mod_name, sys.modules)
+
+        self.wb.unload("cleanup_brick")
+        self.assertNotIn(mod_name, sys.modules)
+
+        # Test failure cleanup
+        fail_conn = "raise RuntimeError('connector load fail')\n"
+        pkg_fail = create_brick(self.tempdir / "fail.wb", brick_id="fail_brick", capability="fail_cap", connector_code=fail_conn)
+        self.wb.install(pkg_fail)
+        with self.assertRaises(RuntimeError):
+            self.wb.load("fail_brick")
+        self.assertNotIn("whitebase_brick_fail_brick", sys.modules)
+
     # --- Defect 2: Real timeouts regression tests ---
     def test_real_timeout_terminates_execution(self) -> None:
         conn = (
@@ -158,7 +178,71 @@ class AuditedDefectsRegressionTests(unittest.TestCase):
         elapsed = time.time() - t0
         self.assertLess(elapsed, 2.0, f"Timeout took too long to terminate: {elapsed}s")
 
-    # --- Defect 3: Manifest validation regression tests ---
+    # --- Defect 3: Streaming lifecycle regression tests ---
+    def test_streaming_tracks_active_requests_and_prevents_unload(self) -> None:
+        conn = (
+            "class Brick:\n"
+            "    def stream(self, cap, payload, metadata=None):\n"
+            "        yield 'chunk1'\n"
+            "        yield 'chunk2'\n"
+        )
+        pkg = create_brick(
+            self.tempdir / "stream_brick.wb",
+            brick_id="s_brick",
+            capability="s_cap",
+            runtime={"streaming": True},
+            connector_code=conn,
+        )
+        self.wb.install(pkg)
+        stream = self.wb.stream_request("s_cap", {}, target="s_brick")
+
+        # Before finishing stream, active_requests must be 1
+        first = next(stream)
+        self.assertEqual(first, "chunk1")
+        self.assertEqual(self.wb.inspect("s_brick")["active_requests"], 1)
+
+        # Unload during active stream must be rejected
+        with self.assertRaisesRegex(RuntimeError, "active requests"):
+            self.wb.unload("s_brick")
+
+        second = next(stream)
+        self.assertEqual(second, "chunk2")
+
+        with self.assertRaises(StopIteration):
+            next(stream)
+
+        # After stream completion, active_requests released
+        self.assertEqual(self.wb.inspect("s_brick")["active_requests"], 0)
+        self.assertEqual(self.wb.inspect("s_brick")["successful_requests"], 1)
+
+        # Now unload succeeds
+        self.wb.unload("s_brick")
+        self.assertEqual(self.wb.inspect("s_brick")["state"], "stopped")
+
+    def test_streaming_error_releases_active_requests(self) -> None:
+        conn = (
+            "class Brick:\n"
+            "    def stream(self, cap, payload, metadata=None):\n"
+            "        yield 'ok'\n"
+            "        raise RuntimeError('stream boom')\n"
+        )
+        pkg = create_brick(
+            self.tempdir / "err_stream.wb",
+            brick_id="err_stream",
+            capability="err_stream_cap",
+            runtime={"streaming": True},
+            connector_code=conn,
+        )
+        self.wb.install(pkg)
+        stream = self.wb.stream_request("err_stream_cap", {}, target="err_stream")
+        self.assertEqual(next(stream), "ok")
+        with self.assertRaisesRegex(RuntimeError, "stream boom"):
+            next(stream)
+
+        self.assertEqual(self.wb.inspect("err_stream")["active_requests"], 0)
+        self.assertEqual(self.wb.inspect("err_stream")["failed_requests"], 1)
+
+    # --- Defect 4: Manifest validation regression tests ---
     def test_unsupported_format_major_version_rejected(self) -> None:
         with self.assertRaises(ManifestValidationError):
             validate_manifest({
@@ -205,9 +289,8 @@ class AuditedDefectsRegressionTests(unittest.TestCase):
         with self.assertRaises(BrickPackageError):
             self.wb.install(pkg)
 
-    # --- Defect 4: Install and routing robustness regression tests ---
+    # --- Defect 5: Install and routing robustness regression tests ---
     def test_discovery_ignores_stale_staging_and_backup_dirs(self) -> None:
-        # Create a hidden staging directory and backup directory in install_dir
         staging = self.install_dir / ".stale.staging-12345"
         staging.mkdir(parents=True)
         (staging / "manifest.json").write_text('{"invalid": true}')
@@ -216,7 +299,6 @@ class AuditedDefectsRegressionTests(unittest.TestCase):
         backup.mkdir(parents=True)
         (backup / "manifest.json").write_text('{"invalid": true}')
 
-        # Re-initialize runtime
         fresh_wb = WhiteBase(self.install_dir)
         self.assertEqual(fresh_wb.list_components(), [])
         self.assertEqual(fresh_wb.discovery_errors, [])
@@ -234,7 +316,6 @@ class AuditedDefectsRegressionTests(unittest.TestCase):
         pkg = create_brick(self.tempdir / "dup.wb", brick_id="dup_brick", capability="dup_cap")
         self.wb.install(pkg)
         self.assertEqual(self.wb.capabilities()["dup_cap"], ["dup_brick"])
-        # Reinstall same package
         self.wb.install(pkg)
         self.assertEqual(self.wb.capabilities()["dup_cap"], ["dup_brick"])
 
@@ -247,9 +328,17 @@ class AuditedDefectsRegressionTests(unittest.TestCase):
         with self.assertRaises(AmbiguousRoutingError):
             self.wb.request("shared_cap", {})
 
-        # Specifying target resolves disambiguation
         res = self.wb.request("shared_cap", {"v": 1}, target="provider1")
         self.assertEqual(res, {"echo": {"v": 1}})
+
+    def test_ambiguous_routing_raises_error_on_tied_priorities(self) -> None:
+        pkg1 = create_brick(self.tempdir / "tp1.wb", brick_id="tp1", capability="tied_cap", metadata={"priority": 10})
+        pkg2 = create_brick(self.tempdir / "tp2.wb", brick_id="tp2", capability="tied_cap", metadata={"priority": 10})
+        self.wb.install(pkg1)
+        self.wb.install(pkg2)
+
+        with self.assertRaises(AmbiguousRoutingError):
+            self.wb.request("tied_cap", {})
 
     def test_provider_selection_respects_priority_and_default_metadata(self) -> None:
         pkg_low = create_brick(

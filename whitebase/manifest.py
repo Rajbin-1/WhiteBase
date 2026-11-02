@@ -22,7 +22,7 @@ class ManifestValidationError(ValueError):
 
 def _safe_package_path(value: str, *, field_name: str) -> PurePosixPath:
     if not isinstance(value, str) or not value or "\x00" in value:
-        raise ManifestValidationError(f"{field_name} must be a non-empty relative path")
+        raise ManifestValidationError(f"{field_name} must be a non-empty relative path without null bytes")
     normalized = value.replace("\\", "/")
     path = PurePosixPath(normalized)
     if (
@@ -123,6 +123,8 @@ def validate_package_archive(archive: ZipFile) -> BrickManifestRecord:
 
     total_size = 0
     for entry in entries:
+        if "\x00" in entry.filename:
+            raise ManifestValidationError(f"Null bytes are not allowed in archive paths: {entry.filename}")
         if entry.is_dir():
             name = entry.filename.rstrip("/")
         else:
@@ -186,7 +188,9 @@ def load_manifest(path: str | Path) -> BrickManifestRecord:
     with file_path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
     manifest = validate_manifest(data)
-    manifest.checksum = _sha256_file(file_path)
+    # If checksum was not declared in manifest.json, compute sha256 of the manifest file
+    if not manifest.checksum:
+        manifest.checksum = _sha256_file(file_path)
     return manifest
 
 
